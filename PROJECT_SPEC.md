@@ -27,7 +27,10 @@ external service.
 - Measurement: an observed value, computed deviation, acceptance decision,
   technician, and timestamp.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
-  selected accepted measurement.
+  selected accepted measurement and a frozen snapshot of the reviewer
+  qualification basis in force when the seal was created.
+- ReviewerQualification: a reviewer's eligibility to seal, with a review scope,
+  a validity window, and an active or suspended status.
 - AuditEvent: an append-only trace of meaningful case and device changes.
 
 ## Workflows
@@ -60,10 +63,33 @@ service records the actor and reason in the audit trail.
 
 ### 5. Seal Verification
 
-The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
-`review_ready` cases may be sealed. The service selects the accepted
-measurement with the smallest absolute deviation, creates exactly one evidence
-seal, moves the case to `sealed`, and rejects later mutations.
+The verifier sends `POST /cases/{id}/seal` after an accepted measurement, naming
+the reviewer and the reviewer's qualification. Only `review_ready` cases may be
+sealed, and only by a reviewer whose qualification exists, is active, and covers
+the decision instant within its validity window. The qualification check, the
+case transition, and the seal write happen in one repository commit using one
+decision instant: a rejected seal leaves no case state, seal, or audit event
+behind. A valid request selects the accepted measurement with the smallest
+absolute deviation, freezes the qualification basis (id, reviewer, scope,
+validity window, capture time) into the seal, creates exactly one evidence
+seal, moves the case to `sealed`, and rejects later mutations. The frozen basis
+is what every later read returns; suspension or expiry of the qualification
+after sealing never rewrites it.
+
+### 6. Register Reviewer Qualification
+
+The steward sends `POST /qualifications` with the reviewer name, review scope,
+and a validity window. The service validates the window (`valid_until` after
+`valid_from`) and creates an active qualification.
+
+### 7. Suspend Reviewer Qualification
+
+The steward sends `POST /qualifications/{id}/suspend` with a reason. Only an
+active qualification can be suspended. Suspension and sealing serialize under
+the repository mutation lock, so when they arrive together exactly one order
+wins: a seal committed while the qualification is active stays valid (with its
+frozen basis) even though suspension follows, while suspension committed first
+makes the seal request fail with no effect.
 
 ## State And Rules
 
@@ -88,6 +114,13 @@ Required invariants:
 - A tolerance must be positive.
 - A case can have at most one evidence seal.
 - A sealed case cannot accept measurements, reopen, or seal again.
+- A seal can only be created by the reviewer named on a qualification that is
+  active and within its validity window at the single decision instant of the
+  sealing commit.
+- Qualification authorization and all seal writes share one repository commit;
+  a rejected seal leaves no case, seal, authority, or audit trace.
+- An evidence seal carries an immutable snapshot of the qualification basis at
+  decision time, which later suspension or expiry never changes.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 
@@ -113,6 +146,9 @@ Required invariants:
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+- `POST /qualifications`
+- `GET /qualifications/{id}`
+- `POST /qualifications/{id}/suspend`
 
 ## Validation Plan
 

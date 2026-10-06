@@ -22,6 +22,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow seal-reviewer-qualification
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -42,6 +43,15 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+- `POST /qualifications`
+- `GET /qualifications/{id}`
+- `POST /qualifications/{id}/suspend`
+
+A seal request must name a reviewer and a `qualification_id`. The
+qualification must be active and within its validity window at the moment the
+seal commits; the resulting seal keeps an immutable snapshot of that
+qualification basis, so later suspension or expiry does not change a completed
+seal.
 
 ## Layout
 
