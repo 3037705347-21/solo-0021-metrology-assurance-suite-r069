@@ -60,10 +60,17 @@ service records the actor and reason in the audit trail.
 
 ### 5. Seal Verification
 
-The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
-`review_ready` cases may be sealed. The service selects the accepted
-measurement with the smallest absolute deviation, creates exactly one evidence
-seal, moves the case to `sealed`, and rejects later mutations.
+The verifier sends `POST /cases/{id}/seal` after an accepted measurement and
+names the reviewer qualification under which they sign. Only `review_ready`
+cases may be sealed, and only when the named qualification exists, belongs to
+the requesting reviewer, is active, and currently covers the seal instant
+inside its validity window. The qualification check and the seal are decided
+on one repository snapshot in the same atomic commit, so suspension or expiry
+cannot interleave. The service selects the accepted measurement with the
+smallest absolute deviation, snapshots the qualification as an immutable
+basis on the seal, creates exactly one evidence seal, moves the case to
+`sealed`, and rejects later mutations. Later suspension or expiry of the
+qualification never rewrites or hides the basis frozen on a completed seal.
 
 ## State And Rules
 
@@ -90,6 +97,13 @@ Required invariants:
 - A sealed case cannot accept measurements, reopen, or seal again.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
+- A seal is accepted only when the named qualification exists, is held by the
+  requesting reviewer, is active, and covers the seal instant within its
+  validity window; the check and the seal are one atomic commit.
+- A rejected seal rolls back completely and leaves no case state, evidence
+  seal, or audit event behind.
+- Each seal carries an immutable snapshot of the qualification basis at the
+  seal instant; later suspension or expiry never changes or removes it.
 
 ## Modules
 
@@ -121,7 +135,11 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The reviewer-qualification-seal check proves that expired, suspended,
+not-yet-valid, mismatched, and missing qualifications are rejected without
+leaving a case, seal, or event behind; that a valid seal freezes its
+qualification basis so later suspension does not rewrite it; and that a
+suspension raced against a seal converges to a single consistent result.
 
 Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add unit and integration tests, including red/green

@@ -35,11 +35,12 @@ func main() {
 	flag.Parse()
 
 	checks := map[string]func() error{
-		"register-device":          checkRegisterDevice,
-		"open-verification-case":   checkOpenVerificationCase,
-		"record-measurement":       checkRecordMeasurement,
-		"reopen-verification-case": checkReopenVerificationCase,
-		"seal-verification":        checkSealVerification,
+		"register-device":             checkRegisterDevice,
+		"open-verification-case":      checkOpenVerificationCase,
+		"record-measurement":          checkRecordMeasurement,
+		"reopen-verification-case":    checkReopenVerificationCase,
+		"seal-verification":           checkSealVerification,
+		"reviewer-qualification-seal": checkReviewerQualificationSeal,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -322,9 +323,15 @@ func checkSealVerification() error {
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
+			qualificationID, err := h.registerQualification(fmt.Sprintf("Reviewer-%d", index+1), validWindow())
+			if err != nil {
+				results <- outcome{err: err}
+				return
+			}
 			response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
-				"reviewer": fmt.Sprintf("Reviewer-%d", index+1),
-				"summary":  "accepted measurement sealed for review",
+				"reviewer":         fmt.Sprintf("Reviewer-%d", index+1),
+				"summary":          "accepted measurement sealed for review",
+				"qualification_id": qualificationID,
 			})
 			results <- outcome{response: response, err: err}
 		}(index)
@@ -373,6 +380,231 @@ func checkSealVerification() error {
 		return errors.New("evidence seal is missing")
 	}
 	return nil
+}
+
+// checkReviewerQualificationSeal covers the qualification -> seal chain:
+// only an active, in-window qualification can seal; a rejected seal leaves no
+// trace; the frozen basis survives later suspension/expiry; and a suspension
+// racing a seal converges to exactly one outcome.
+func checkReviewerQualificationSeal() error {
+	h := newHarness()
+	defer h.close()
+
+	// A seal request without a qualification is rejected and leaves the
+	// case untouched.
+	caseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	missing, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-NoQual",
+		"summary":  "seal without a qualification",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(missing, "invalid_input"); err != nil {
+		return err
+	}
+
+	// An expired qualification cannot seal and leaves no trace.
+	expiredID, err := h.registerQualification("Reviewer-Expired", expiredWindow())
+	if err != nil {
+		return err
+	}
+	expired, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":         "Reviewer-Expired",
+		"summary":          "seal attempted after qualification expiry",
+		"qualification_id": expiredID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(expired, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(expired, "state_conflict"); err != nil {
+		return err
+	}
+
+	// A qualification registered for another reviewer does not authorize.
+	mismatchID, err := h.registerQualification("Reviewer-SomeoneElse", validWindow())
+	if err != nil {
+		return err
+	}
+	mismatch, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":         "Reviewer-Valid",
+		"summary":          "seal attempted under someone else's qualification",
+		"qualification_id": mismatchID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(mismatch, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(mismatch, "state_conflict"); err != nil {
+		return err
+	}
+
+	// An unknown qualification id is rejected and leaves no trace.
+	unknown, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":         "Reviewer-Valid",
+		"summary":          "seal with a missing qualification",
+		"qualification_id": "qualification-9999",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unknown, http.StatusNotFound); err != nil {
+		return err
+	}
+	if err := expectErrorCode(unknown, "not_found"); err != nil {
+		return err
+	}
+
+	// A not-yet-valid qualification cannot seal and leaves no trace.
+	futureID, err := h.registerQualification("Reviewer-Future", futureWindow())
+	if err != nil {
+		return err
+	}
+	future, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":         "Reviewer-Future",
+		"summary":          "seal attempted before qualification starts",
+		"qualification_id": futureID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(future, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(future, "state_conflict"); err != nil {
+		return err
+	}
+
+	// A suspended qualification cannot seal and leaves no trace.
+	suspendedID, err := h.registerQualification("Reviewer-Suspended", validWindow())
+	if err != nil {
+		return err
+	}
+	if err := h.suspendQualification(suspendedID, "reviewer temporarily suspended"); err != nil {
+		return err
+	}
+	suspended, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":         "Reviewer-Suspended",
+		"summary":          "seal attempted while suspended",
+		"qualification_id": suspendedID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(suspended, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(suspended, "state_conflict"); err != nil {
+		return err
+	}
+
+	// None of the rejected attempts moved the case or created a seal.
+	if err := h.assertCaseState(caseID, "review_ready"); err != nil {
+		return err
+	}
+
+	// A valid reviewer seals successfully; the qualification basis is
+	// frozen on the seal and still reads back after suspension.
+	validID, err := h.registerQualification("Reviewer-Valid", validWindow())
+	if err != nil {
+		return err
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":         "Reviewer-Valid",
+		"summary":          "accepted measurement sealed under a valid qualification",
+		"qualification_id": validID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	basisReviewer, err := nestedString(sealed.Body, "authority", "reviewer")
+	if err != nil {
+		return err
+	}
+	if basisReviewer != "Reviewer-Valid" {
+		return fmt.Errorf("authority reviewer = %q", basisReviewer)
+	}
+	basisStatus, err := nestedString(sealed.Body, "authority", "status")
+	if err != nil {
+		return err
+	}
+	if basisStatus != "active" {
+		return fmt.Errorf("authority status = %q, expected active snapshot", basisStatus)
+	}
+	if err := h.suspendQualification(validID, "suspended after sealing"); err != nil {
+		return err
+	}
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	if _, err := nestedString(read.Body, "authority", "qualification_id"); err != nil {
+		return fmt.Errorf("sealed case no longer shows its qualification basis: %w", err)
+	}
+	readBasisStatus, err := nestedString(read.Body, "authority", "status")
+	if err != nil {
+		return err
+	}
+	if readBasisStatus != "active" {
+		return fmt.Errorf("frozen basis was rewritten by suspension: status = %q", readBasisStatus)
+	}
+	readBasisID, err := nestedString(read.Body, "authority", "qualification_id")
+	if err != nil {
+		return err
+	}
+	if readBasisID != validID {
+		return fmt.Errorf("frozen basis id = %q, expected %q", readBasisID, validID)
+	}
+	sealEvents, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if countEvents(sealEvents.Body, "case_sealed") != 1 {
+		return errors.New("rejected seal attempts left audit events")
+	}
+
+	// The case is sealed once; a second valid reviewer cannot reseal.
+	otherID, err := h.registerQualification("Reviewer-Other", validWindow())
+	if err != nil {
+		return err
+	}
+	again, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":         "Reviewer-Other",
+		"summary":          "repeat seal attempt",
+		"qualification_id": otherID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(again, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(again, "seal_exists"); err != nil {
+		return err
+	}
+
+	// Suspension and seal submitted together converge to one clear outcome:
+	// either the seal commits first and keeps its frozen active basis (a later
+	// suspension cannot rewrite it), or suspension commits first and the seal is
+	// rejected with the case still reviewable and seal-free.
+	return h.checkSuspensionSealRace("MET-1502")
 }
 
 func newHarness() *harness {
@@ -507,6 +739,191 @@ func (h *harness) readyCase(tag string) (string, error) {
 		return "", err
 	}
 	return caseID, nil
+}
+
+// checkSuspensionSealRace submits a suspension and a seal for the same
+// qualification at the same time and requires one convergent result:
+// exactly one side wins, and the persisted state matches the winners.
+func (h *harness) checkSuspensionSealRace(tag string) error {
+	caseID, err := h.readyCase(tag)
+	if err != nil {
+		return err
+	}
+	qualificationID, err := h.registerQualification("Reviewer-Race", validWindow())
+	if err != nil {
+		return err
+	}
+	type outcome struct {
+		name     string
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	fire := func(name string, call func() (apiResponse, error)) {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			response, err := call()
+			results <- outcome{name: name, response: response, err: err}
+		}()
+	}
+	fire("suspend", func() (apiResponse, error) {
+		return h.request(http.MethodPost, "/qualifications/"+qualificationID+"/suspend", map[string]any{
+			"reason": "suspension raced with seal",
+		})
+	})
+	fire("seal", func() (apiResponse, error) {
+		return h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+			"reviewer":         "Reviewer-Race",
+			"summary":          "seal racing with suspension",
+			"qualification_id": qualificationID,
+		})
+	})
+	wait.Wait()
+	close(results)
+
+	statusByName := map[string]int{}
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		if item.response.Status != http.StatusOK &&
+			item.response.Status != http.StatusCreated &&
+			item.response.Status != http.StatusConflict {
+			return fmt.Errorf("unexpected %s race status %d: %s", item.name, item.response.Status, item.response.Raw)
+		}
+		statusByName[item.name] = item.response.Status
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	state, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case statusByName["seal"] == http.StatusCreated:
+		// Seal committed first: the suspension may still succeed, but it
+		// can never reach into the completed seal. The persisted seal must
+		// keep the active basis frozen at signing time, and not read back
+		// as a seal signed by a suspended reviewer.
+		if statusByName["suspend"] != http.StatusOK && statusByName["suspend"] != http.StatusConflict {
+			return fmt.Errorf("seal won the race but suspension status = %d", statusByName["suspend"])
+		}
+		if state != "sealed" {
+			return fmt.Errorf("seal reported success but case state = %q", state)
+		}
+		basis, err := nestedString(read.Body, "authority", "status")
+		if err != nil {
+			return err
+		}
+		if basis != "active" {
+			return fmt.Errorf("seal basis = %q, expected the active snapshot frozen at sealing", basis)
+		}
+		basisReviewer, err := nestedString(read.Body, "authority", "reviewer")
+		if err != nil {
+			return err
+		}
+		if basisReviewer != "Reviewer-Race" {
+			return fmt.Errorf("seal basis reviewer = %q", basisReviewer)
+		}
+	case statusByName["seal"] == http.StatusConflict && statusByName["suspend"] == http.StatusOK:
+		// Suspension committed first: the seal is rejected and the
+		// case stays reviewable with no seal.
+		if state != "review_ready" {
+			return fmt.Errorf("suspension won the race but case state = %q", state)
+		}
+		if _, hasSeal := read.Body["seal"]; hasSeal {
+			return errors.New("rejected seal left a seal behind")
+		}
+	default:
+		return fmt.Errorf("race did not converge: statuses = %v", statusByName)
+	}
+	return nil
+}
+
+func (h *harness) registerQualification(reviewer string, window [2]time.Time) (string, error) {
+	response, err := h.request(http.MethodPost, "/qualifications", map[string]any{
+		"reviewer":    reviewer,
+		"scope":       "dimensional verification",
+		"valid_from":  window[0].Format(time.RFC3339),
+		"valid_until": window[1].Format(time.RFC3339),
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := expectStatus(response, http.StatusCreated); err != nil {
+		return "", err
+	}
+	return nestedString(response.Body, "qualification", "id")
+}
+
+func (h *harness) suspendQualification(id, reason string) error {
+	response, err := h.request(http.MethodPost, "/qualifications/"+id+"/suspend", map[string]any{
+		"reason": reason,
+	})
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusOK)
+}
+
+func (h *harness) assertCaseState(caseID, expected string) error {
+	response, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(response, http.StatusOK); err != nil {
+		return err
+	}
+	state, err := nestedString(response.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != expected {
+		return fmt.Errorf("case state = %q, expected %q", state, expected)
+	}
+	if _, hasSeal := response.Body["seal"]; hasSeal {
+		return errors.New("a rejected seal left an evidence seal behind")
+	}
+	return nil
+}
+
+func countEvents(root map[string]any, kind string) int {
+	items, err := nestedSlice(root, "events")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, item := range items {
+		event, ok := item.(map[string]any)
+		if ok && event["kind"] == kind {
+			count++
+		}
+	}
+	return count
+}
+
+func validWindow() [2]time.Time {
+	now := time.Now().UTC()
+	return [2]time.Time{now.Add(-time.Hour), now.Add(time.Hour)}
+}
+
+func expiredWindow() [2]time.Time {
+	now := time.Now().UTC()
+	return [2]time.Time{now.Add(-2 * time.Hour), now.Add(-time.Hour)}
+}
+
+func futureWindow() [2]time.Time {
+	now := time.Now().UTC()
+	return [2]time.Time{now.Add(time.Hour), now.Add(2 * time.Hour)}
 }
 
 func expectStatus(response apiResponse, expected int) error {

@@ -236,15 +236,8 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	var result contracts.CaseResponse
 	reviewer := strings.TrimSpace(input.Reviewer)
 	qualificationID := strings.TrimSpace(input.QualificationID)
-	var qualification *domain.ReviewerQualification
-	if qualificationID != "" {
-		found, err := s.Qualification(ctx, qualificationID)
-		if err != nil {
-			return result, err
-		}
-		qualification = &found
-	}
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		sealedAt := s.now()
 		id := strings.TrimSpace(caseID)
 		item, exists := m.Case(id)
 		if !exists {
@@ -257,7 +250,23 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
-		if err := item.Seal(s.now()); err != nil {
+		// Authorization is decided on the same committed snapshot and at the
+		// same instant as the seal, under the mutation lock. A suspension
+		// cannot interleave, and any failure rolls back the whole
+		// transaction, so a rejected seal leaves no case, seal, or event.
+		if qualificationID == "" {
+			return fmt.Errorf("%w: a reviewer qualification is required to seal", domain.ErrInvalidInput)
+		}
+		qualification, exists := m.Qualification(qualificationID)
+		if !exists {
+			return fmt.Errorf("%w: qualification %s", domain.ErrNotFound, qualificationID)
+		}
+		if !qualification.Authorizes(reviewer, sealedAt) {
+			return fmt.Errorf("%w: reviewer %s is not qualified to seal case %s", domain.ErrStateConflict, reviewer, item.ID)
+		}
+		// Freeze the qualification basis at the seal instant.
+		basis, err := domain.NewQualificationBasis(qualification, sealedAt)
+		if err != nil {
 			return err
 		}
 		seal, err := domain.NewEvidenceSeal(
@@ -265,14 +274,17 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			item.ID,
 			item.DeviceID,
 			measurement.ID,
-			input.Reviewer,
+			reviewer,
 			input.Summary,
-			s.now(),
+			basis,
+			sealedAt,
 		)
 		if err != nil {
 			return err
 		}
-		seal.QualificationID = qualificationID
+		if err := item.Seal(sealedAt); err != nil {
+			return err
+		}
 		if err := m.PutSeal(seal); err != nil {
 			return err
 		}
@@ -287,7 +299,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			"case_sealed",
 			seal.Reviewer,
 			seal.Summary,
-			s.now(),
+			sealedAt,
 		)
 		if err != nil {
 			return err
@@ -298,9 +310,6 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	})
 	if err != nil {
 		return contracts.CaseResponse{}, err
-	}
-	if qualification != nil && !qualification.Authorizes(reviewer, s.now()) {
-		return contracts.CaseResponse{}, fmt.Errorf("%w: reviewer %s may not seal this case", domain.ErrStateConflict, reviewer)
 	}
 	return result, nil
 }
@@ -414,10 +423,12 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 		Events:       m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
+		seal := seal
 		result.Seal = &seal
-		if qualification, ok := m.Qualification(seal.QualificationID); ok {
-			result.Authority = &qualification
-		}
+		// The authority is the basis frozen inside the seal at signing
+		// time, never the current qualification row.
+		basis := seal.Basis
+		result.Authority = &basis
 	}
 	return result
 }
@@ -429,10 +440,10 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 		Events:       snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
+		seal := seal
 		result.Seal = &seal
-		if qualification, ok := snapshot.Qualification(seal.QualificationID); ok {
-			result.Authority = &qualification
-		}
+		basis := seal.Basis
+		result.Authority = &basis
 	}
 	return result
 }

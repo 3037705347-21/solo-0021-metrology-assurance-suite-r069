@@ -56,11 +56,11 @@ type DeviceResponse struct {
 }
 
 type CaseResponse struct {
-	Case         domain.VerificationCase       `json:"case"`
-	Measurements []domain.Measurement          `json:"measurements"`
-	Seal         *domain.EvidenceSeal          `json:"seal,omitempty"`
-	Authority    *domain.ReviewerQualification `json:"authority,omitempty"`
-	Events       []domain.AuditEvent           `json:"events"`
+	Case         domain.VerificationCase    `json:"case"`
+	Measurements []domain.Measurement       `json:"measurements"`
+	Seal         *domain.EvidenceSeal       `json:"seal,omitempty"`
+	Authority    *domain.QualificationBasis `json:"authority,omitempty"`
+	Events       []domain.AuditEvent        `json:"events"`
 }
 
 type EventsResponse struct {
